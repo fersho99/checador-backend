@@ -1,15 +1,21 @@
 import io
+import logging
 import os
 import time
 
 import face_recognition
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 from supabase import Client, create_client
 
+from logging_config import configurar_logging
+
 load_dotenv()
+configurar_logging()
+logger = logging.getLogger("checador")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -20,17 +26,52 @@ TAMANO_MAXIMO_BYTES = 10 * 1024 * 1024
 
 app = FastAPI(title="Servicio de verificacion facial")
 db: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+logger.info("Servicio iniciado. Conectado a Supabase: %s", SUPABASE_URL)
+
+
+@app.middleware("http")
+async def log_peticiones(request: Request, llamar_siguiente):
+    """Registra cada peticion (metodo, ruta, status y duracion) para poder
+    diagnosticar fallas cuando el backend se ejecuta en otra maquina."""
+    inicio = time.perf_counter()
+    try:
+        respuesta = await llamar_siguiente(request)
+    except Exception:
+        duracion_ms = (time.perf_counter() - inicio) * 1000
+        logger.exception(
+            "ERROR sin manejar en %s %s (%.1f ms)",
+            request.method,
+            request.url.path,
+            duracion_ms,
+        )
+        return JSONResponse(
+            status_code=500, content={"detail": "Error interno del servicio."}
+        )
+
+    duracion_ms = (time.perf_counter() - inicio) * 1000
+    nivel = logging.INFO if respuesta.status_code < 400 else logging.WARNING
+    logger.log(
+        nivel,
+        "%s %s -> %s (%.1f ms)",
+        request.method,
+        request.url.path,
+        respuesta.status_code,
+        duracion_ms,
+    )
+    return respuesta
 
 
 def empleado_autenticado(authorization: str = Header(default="")) -> str:
     """Valida el JWT de Supabase y devuelve el id del empleado dueno de la sesion."""
     esquema, _, token = authorization.partition(" ")
     if esquema.lower() != "bearer" or not token:
+        logger.warning("Peticion sin header Authorization valido.")
         raise HTTPException(401, "Falta la sesion (header Authorization: Bearer <token>).")
 
     try:
         usuario = db.auth.get_user(token).user
     except Exception:
+        logger.exception("Fallo al validar el token contra Supabase Auth.")
         usuario = None
     if usuario is None:
         raise HTTPException(401, "Sesion invalida o expirada.")
@@ -44,6 +85,7 @@ def empleado_autenticado(authorization: str = Header(default="")) -> str:
         .execute()
     )
     if not respuesta.data:
+        logger.warning("Usuario auth %s no tiene empleado activo asociado.", usuario.id)
         raise HTTPException(403, "Esta cuenta no corresponde a un empleado activo.")
 
     return respuesta.data[0]["id"]
@@ -109,6 +151,7 @@ def registrar_rostro(
         .execute()
     )
     if ya_registrado.data["rostro_registrado"]:
+        logger.warning("Empleado %s intento re-registrar su rostro.", empleado_id)
         raise HTTPException(
             409, "Ya hay un rostro registrado; pide a un administrador que lo restablezca."
         )
@@ -130,6 +173,7 @@ def registrar_rostro(
         "id", empleado_id
     ).execute()
 
+    logger.info("Empleado %s registro su rostro correctamente.", empleado_id)
     return {"registrado": True}
 
 
@@ -151,6 +195,7 @@ def checar(
         .execute()
     )
     if not respuesta.data:
+        logger.warning("Empleado %s intento checar sin rostro registrado.", empleado_id)
         raise HTTPException(404, "Todavia no has registrado tu rostro.")
 
     ultima = (
@@ -163,8 +208,10 @@ def checar(
     )
     ultimo_tipo = ultima.data[0]["tipo"] if ultima.data else None
     if tipo == "entrada" and ultimo_tipo == "entrada":
+        logger.warning("Empleado %s intento marcar entrada duplicada.", empleado_id)
         raise HTTPException(409, "Ya registraste tu entrada; falta la salida.")
     if tipo == "salida" and ultimo_tipo != "entrada":
+        logger.warning("Empleado %s intento marcar salida sin entrada abierta.", empleado_id)
         raise HTTPException(409, "No hay una entrada abierta para registrar la salida.")
 
     imagen = preparar_imagen(foto.file.read())
@@ -177,6 +224,12 @@ def checar(
     confianza = round(max(0.0, 1.0 - distancia), 2)
 
     if distancia > UMBRAL_COINCIDENCIA:
+        logger.info(
+            "Checada de %s (%s) rechazada por rostro no coincidente (confianza=%.2f).",
+            empleado_id,
+            tipo,
+            confianza,
+        )
         return {"coincide": False, "confianza": confianza}
 
     # La foto de evidencia se guarda solo cuando la checada fue aceptada.
@@ -185,4 +238,7 @@ def checar(
         {"empleado_id": empleado_id, "tipo": tipo, "metodo_biometrico": "rostro"}
     ).execute()
 
+    logger.info(
+        "Checada de %s (%s) aceptada (confianza=%.2f).", empleado_id, tipo, confianza
+    )
     return {"coincide": True, "confianza": confianza}
