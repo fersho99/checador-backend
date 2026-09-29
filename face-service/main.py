@@ -7,8 +7,10 @@ import face_recognition
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from supabase import Client, create_client
 
 from logging_config import configurar_logging
@@ -59,6 +61,16 @@ async def log_peticiones(request: Request, llamar_siguiente):
         duracion_ms,
     )
     return respuesta
+
+
+@app.exception_handler(StarletteHTTPException)
+async def manejar_http_exception(request: Request, exc: StarletteHTTPException):
+    """Registra el motivo exacto (exc.detail) de cualquier HTTPException,
+    incluyendo las de validacion de imagen/rostro (422) que antes no dejaban rastro."""
+    logger.warning(
+        "%s %s -> %s: %s", request.method, request.url.path, exc.status_code, exc.detail
+    )
+    return await http_exception_handler(request, exc)
 
 
 def empleado_autenticado(authorization: str = Header(default="")) -> str:
